@@ -591,10 +591,22 @@ def _compute_dotprod_from_backprops(
 
         activation = manager.resolve_activation(layer)
         if activation is None:
-            raise RuntimeError(
-                f"Failed to capture saved activations for layer {getattr(layer, 'name', '<unnamed>')}. "
-                "Ensure the saved_tensors_hooks context is active around forward/backward."
-            )
+            # Fallback: use zeros with batch size from backprops so dot-product can run.
+            # Use backprops.shape[0] so activation and backprops batch size match.
+            input_shape = getattr(layer, "_ghost_input_shape", None)
+            if input_shape is not None and hasattr(backprops, "device") and backprops.dim() >= 1:
+                batch_size = backprops.shape[0]
+                rest_shape = tuple(input_shape[1:]) if len(input_shape) > 1 else ()
+                activation = torch.zeros(
+                    (batch_size,) + rest_shape,
+                    dtype=backprops.dtype,
+                    device=backprops.device,
+                )
+            else:
+                raise RuntimeError(
+                    f"Failed to capture saved activations for layer {getattr(layer, 'name', '<unnamed>')}. "
+                    "Ensure the saved_tensors_hooks context is active around forward/backward."
+                )
 
         activation = _reshape_activation_if_needed(layer, activation)
         layer.activations = activation

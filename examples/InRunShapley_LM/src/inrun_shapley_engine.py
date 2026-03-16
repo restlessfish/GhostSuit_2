@@ -90,6 +90,10 @@ class InRunShapleyEngine(GradDotProdEngine):
         # Track total number of training samples seen
         self.total_samples_seen = 0
         
+        # Second-order: H @ g_val (Hessian-vector product with validation gradient)
+        # Computed in set_validation_loss(), used in aggregate_and_log() when order==2
+        self._hvp_val: Optional[Dict[str, torch.Tensor]] = None
+        
         print(f"[INFO] In-Run Shapley Engine initialized with order={order}, accumulate={accumulate_shapley}")
     
     def _compute_shapley_from_dot_product(
@@ -139,31 +143,93 @@ class InRunShapleyEngine(GradDotProdEngine):
         
         return dot_product * temperature
     
+    def set_validation_loss(self, val_loss: torch.Tensor) -> None:
+        """
+        Set validation loss and compute H @ g_val (Hessian-vector product with validation gradient)
+        for second-order Shapley. Call this before the train+val forward/backward when order==2.
+        
+        Uses: d/dθ ( (1/2) ||∇L_val||^2 ) = H @ ∇L_val (Hessian of L_val at current θ).
+        """
+        if self.order != 2:
+            return
+        self._hvp_val = None
+        if val_loss is None or not val_loss.requires_grad:
+            return
+        params = [p for _, p in self.named_params if p.requires_grad]
+        if not params:
+            return
+        try:
+            # g_val = ∇_θ L_val (with create_graph so we can differentiate again)
+            g_vals = torch.autograd.grad(val_loss, params, create_graph=True, retain_graph=True)
+            # loss2 = (1/2) ||g_val||^2  =>  ∇_θ loss2 = H @ g_val
+            loss2 = sum(0.5 * (g * g).sum() for g in g_vals)
+            # H @ g_val per parameter (same order as params)
+            hvp_tup = torch.autograd.grad(loss2, params, retain_graph=False)
+            param_names = [name for name, p in self.named_params if p.requires_grad]
+            self._hvp_val = {param_names[i]: hvp_tup[i].detach().clone() for i in range(len(hvp_tup))}
+        except Exception as e:
+            warnings.warn(f"Second-order HVP computation failed: {e}, falling back to first-order.")
+            self._hvp_val = None
+    
+    def _compute_second_order_dot_products(self, batch_size: int) -> Optional[torch.Tensor]:
+        """
+        Compute per-sample second-order term: train_grad_i · (H @ g_val) for each sample i.
+        Uses stored _hvp_val from set_validation_loss() and param.train_grad from current backward.
+        
+        Returns:
+            Tensor of shape [batch_size] with second-order dot products, or None if not available.
+        """
+        if self._hvp_val is None:
+            return None
+        total_second = None
+        for name, param in self.named_params:
+            if not param.initially_requires_grad or name not in self._hvp_val:
+                continue
+            if not hasattr(param, 'train_grad') or param.train_grad is None:
+                continue
+            # param.train_grad: (batch_size, *param_shape); _hvp_val[name]: (*param_shape)
+            train_g = param.train_grad
+            hvp = self._hvp_val[name]
+            if train_g.shape[0] != batch_size or train_g.shape[1:] != hvp.shape:
+                continue
+            # Per-sample dot product: (train_grad * hvp).sum(dim=(1,2,...))
+            dims = tuple(range(1, train_g.dim()))
+            dot = (train_g * hvp).sum(dim=dims)
+            if total_second is None:
+                total_second = dot
+            else:
+                total_second = total_second + dot
+        return total_second
+    
     def _compute_second_order_shapley(
         self,
-        train_grads: Dict[str, torch.Tensor],
-        val_grads: Dict[str, torch.Tensor],
-        hessian_vector_products: Optional[Dict[str, torch.Tensor]] = None,
+        first_order_dot: torch.Tensor,
+        second_order_dot: torch.Tensor,
+        batch_size: int,
+        val_batch_size: int,
+        scale_second: float = 0.5,
     ) -> torch.Tensor:
         """
-        Compute second-order Shapley values using gradient-Hessian-gradient products.
+        Combine first-order and second-order terms for Shapley values.
         
-        This is more accurate but computationally expensive. Requires computing
-        Hessian-vector products.
+        phi_i ∝ first_order_i + scale_second * second_order_i
+        Paper: second-order correction improves mislabel detection (AUROC 0.680).
         
         Args:
-            train_grads: Dictionary of per-sample training gradients
-            val_grads: Dictionary of validation gradients
-            hessian_vector_products: Optional precomputed HVP (for efficiency)
+            first_order_dot: [batch_size] gradient dot products
+            second_order_dot: [batch_size] gradient-Hessian-gradient dot products
+            batch_size: training batch size
+            val_batch_size: validation batch size
+            scale_second: weight for second-order term (e.g. 0.5 or step size)
             
         Returns:
-            Second-order Shapley values
+            Shapley values for this batch, shape [batch_size]
         """
-        # TODO: Implement second-order method
-        # This requires computing HVP efficiently
-        # For now, return first-order approximation
-        warnings.warn("Second-order Shapley not yet implemented, using first-order")
-        return None
+        # Same normalization as first-order, then add second-order correction
+        combined = first_order_dot + scale_second * second_order_dot
+        return self._compute_shapley_from_dot_product(
+            combined, batch_size, val_batch_size
+        )
     
     def aggregate_and_log(self):
         """
@@ -181,11 +247,28 @@ class InRunShapleyEngine(GradDotProdEngine):
             if dot_product is not None and batch_idx is not None:
                 # Compute Shapley values for this batch
                 batch_size = dot_product.shape[0]
-                shapley_batch = self._compute_shapley_from_dot_product(
-                    dot_product, 
-                    batch_size,
-                    self.val_batch_size
-                )
+                if self.order == 2 and self._hvp_val is not None:
+                    second_order_dot = self._compute_second_order_dot_products(batch_size)
+                    if second_order_dot is not None:
+                        second_order_dot = second_order_dot.to(dot_product.device)
+                        # Second-order: phi ∝ <g_i, g_val> + scale * <g_i, H @ g_val>
+                        shapley_batch = self._compute_second_order_shapley(
+                            dot_product,
+                            second_order_dot,
+                            batch_size,
+                            self.val_batch_size,
+                            scale_second=0.5,
+                        )
+                    else:
+                        shapley_batch = self._compute_shapley_from_dot_product(
+                            dot_product, batch_size, self.val_batch_size
+                        )
+                else:
+                    shapley_batch = self._compute_shapley_from_dot_product(
+                        dot_product, 
+                        batch_size,
+                        self.val_batch_size
+                    )
                 
                 # Update accumulated Shapley values
                 # IMPROVEMENT: Use weighted accumulation based on iteration number

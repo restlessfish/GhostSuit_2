@@ -93,14 +93,17 @@ def _compute_linear_dot_product(
 
     total_bs = A.size(0)
     train_bs = total_bs - val_batch_size
-    
+    if train_bs <= 0:
+        return  # val-only backward (e.g. second-order HVP): skip dot product
+
     # Setup Dimensions
     d_in = A.size(-1)
     d_out = B.size(-1)
     A_flat = A.to(compute_dtype).reshape(-1, d_in)
     B_flat = B.to(compute_dtype).reshape(-1, d_out)
 
-    seq_len = A.shape[1]
+    # For 2D input (batch, d_in) e.g. ResNet fc, seq_len=1; for 3D+ (batch, seq_len, d_in) use seq_len
+    seq_len = A.shape[1] if A.dim() > 2 else 1
     split_idx = train_bs * seq_len
 
     A_train = A_flat[:split_idx]  # [train_bs*seq_len, d_in]
@@ -108,17 +111,15 @@ def _compute_linear_dot_product(
     B_train = B_flat[:split_idx]  # [train_bs*seq_len, d_out]
     B_val = B_flat[split_idx:]    # [val_bs*seq_len, d_out]
 
-    # Pre-declare variables for logging reuse
-    grad_val_for_norm = None
-    
     # Decide whether to use ghost computation
     _should_use_ghost_computation(layer, A, B)
 
+    # --- compute validation gradient once and reuse in both branches ---
+    # grad_val: [d_out, d_in]
+    grad_val = torch.matmul(B_val.T, A_val)
+
     if layer.use_ghost_computation:
         # --- ghost computation with associativity trick ---
-
-        # compute validation gradient [d_out, d_in]
-        grad_val = torch.matmul(B_val.T, A_val)
 
         # project grad_val by B_train to remove the d_out dimension 
         # [train_bs*seq_len, d_out] @ [d_out, d_in] = [train_bs*seq_len, d_in]
@@ -130,12 +131,9 @@ def _compute_linear_dot_product(
 
         # [ train_bs*seq_len ] -> [ train_bs ]
         layer.weight.grad_dot_prod = token_scores.view(train_bs, seq_len).sum(dim=1)
-        
+
     else:
-        
         # --- materialize gradients ---
-        # compute validation gradient [d_out, d_in]
-        grad_val = torch.matmul(B_val.T, A_val)
 
         # Reshape for sum-over-T contraction
         A_train_3d = A_train.view(train_bs, seq_len, d_in)
@@ -209,7 +207,7 @@ def _compute_embedding_dot_product(
 
     train_batch_size = A.size(0) - val_batch_size
     if train_batch_size <= 0:
-        raise ValueError("No training samples to compute dot product, check batch sizes.")
+        return  # val-only backward (e.g. second-order HVP): skip dot product
 
     A_train, A_val = torch.split(A, [train_batch_size, val_batch_size], dim=0)
     B_train, B_val = torch.split(B, [train_batch_size, val_batch_size], dim=0)
@@ -405,7 +403,7 @@ def _compute_layernorm_train_grad(
 
     train_batch_size = A.size(0) - val_batch_size
     if train_batch_size <= 0:
-        raise ValueError("No training samples to compute gradients, check batch sizes.")
+        return  # val-only backward (e.g. second-order HVP): skip train_grad
     
     # debug: print out the shapes of A and B & the first few elements
     # print(f"[Grad] Layer Name: {layer.__class__.__name__}")
@@ -507,7 +505,7 @@ def _compute_rmsnorm_train_grad(
     """Compute and apply averaged training gradient for nn.RMSNorm weight."""
     train_batch_size = A.size(0) - val_batch_size
     if train_batch_size <= 0:
-        raise ValueError("No training samples to compute gradients, check batch sizes.")
+        return None  # val-only backward (e.g. second-order HVP): skip train_grad
 
     A_train, _ = torch.split(A, [train_batch_size, val_batch_size], dim=0)
     B_train, _ = torch.split(B, [train_batch_size, val_batch_size], dim=0)
@@ -563,7 +561,7 @@ def _compute_Conv1D_dot_product(
     train_batch_size = A_c.size(0) - val_batch_size
 
     if train_batch_size <= 0:
-        raise ValueError("No training samples to compute dot product, check batch sizes.")
+        return  # val-only backward (e.g. second-order HVP): skip dot product
 
     A_train, A_val = torch.split(A_c, [train_batch_size, val_batch_size], dim=0)
     B_train, B_val = torch.split(B_c, [train_batch_size, val_batch_size], dim=0)
@@ -728,7 +726,7 @@ def _compute_conv2d_dot_product(
 
     train_batch_size = A_c.size(0) - val_batch_size
     if train_batch_size <= 0:
-        raise ValueError("No training samples to compute dot product")
+        return  # val-only backward (e.g. second-order HVP): skip dot product
 
     A_train, A_val = torch.split(A_c, [train_batch_size, val_batch_size], dim=0)
     B_train, B_val = torch.split(B_c, [train_batch_size, val_batch_size], dim=0)
@@ -758,7 +756,12 @@ def _compute_conv2d_dot_product(
         B_train_r_f = B_train_r.to(accum_dtype)
         AA = torch.matmul(A_val_sum.unsqueeze(0), A_train_u_f.transpose(1, 2))
         BB = torch.matmul(B_val_sum.unsqueeze(0), B_train_r_f.transpose(1, 2))
-        layer.weight.grad_dot_prod = torch.sum((AA * BB).to(accum_dtype), dim=[1, 2])
+        if AA.shape == BB.shape:
+            layer.weight.grad_dot_prod = torch.sum((AA * BB).to(accum_dtype), dim=[1, 2])
+        else:
+            grad_train = torch.einsum('bik,bpk->bpi', A_train_u_f, B_train_r_f)
+            grad_val = torch.einsum('ik,pk->pi', A_val_sum, B_val_sum)
+            layer.weight.grad_dot_prod = torch.einsum('pi,bpi->b', grad_val, grad_train)
         if log_grad_norms:
             grad_train = torch.einsum('bik,bpk->bpi', A_train_u_f, B_train_r_f)
             weight_train_norm = (grad_train.to(accum_dtype) ** 2).sum(dim=[1, 2])
