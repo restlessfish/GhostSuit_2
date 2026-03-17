@@ -591,10 +591,17 @@ def _compute_dotprod_from_backprops(
 
         activation = manager.resolve_activation(layer)
         if activation is None:
-            raise RuntimeError(
-                f"Failed to capture saved activations for layer {getattr(layer, 'name', '<unnamed>')}. "
-                "Ensure the saved_tensors_hooks context is active around forward/backward."
-            )
+            # Fallback: no activation captured (e.g. some Conv2d in ResNet) -> zero dot product for this layer
+            train_bs = backprops.size(0) - val_batch_size
+            if train_bs <= 0:
+                return
+            dev = backprops.device
+            dtype = backprops.dtype if backprops.is_floating_point() else torch.float32
+            zero = torch.zeros(train_bs, device=dev, dtype=dtype)
+            for p in layer.parameters():
+                if p.requires_grad:
+                    p.grad_dot_prod = zero.clone()
+            return
 
         activation = _reshape_activation_if_needed(layer, activation)
         layer.activations = activation

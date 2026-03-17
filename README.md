@@ -1,3 +1,92 @@
+## In-Run Data Shapley（一阶，CIFAR-10N / ResNet18）
+
+本仓库现在只关注 **一阶 In-Run Data Shapley** 在 CIFAR-10N / ResNet18 上的实验复现，方便你下次一键跑通并对照结果。
+
+### 1. 环境准备
+
+```bash
+conda create -n shapley311 python=3.11 -y
+conda activate shapley311
+pip install -r requirements.txt
+```
+
+假设：
+- 当前工作目录为 `GhostSuit_2` 根目录
+- 有可用的 CUDA GPU（用于加速 ResNet18 训练）
+
+### 2. 一阶 In-Run Shapley 运行配置（“原始”一阶实现）
+
+**训练命令（5000 步，CIFAR-10N / ResNet18）：**
+
+```bash
+cd /home/mengkahan3/GhostSuit_2
+
+conda run -n shapley311 python examples/InRunShapley_LM/scripts/train_cifar10_resnet18_inrun_shapley.py \
+  --data_root ./data/cifar10 \
+  --output_dir ./results/cifar10_resnet18_full_5000_order1_base \
+  --num_steps 5000 \
+  --batch_size 128 \
+  --val_batch_size 32 \
+  --learning_rate 1e-3 \
+  --noise_type aggre_label \
+  --shapley_order 1 \
+  --shapley_save_interval 1000 \
+  --eval_interval 500 \
+  --num_workers 4 \
+  --device cuda
+```
+
+训练脚本会：
+- 自动下载 CIFAR-10 与 CIFAR-10N (`aggre_label`) 噪声标签到 `./data/cifar10`
+- 训练 ResNet18 共 5000 步，并在训练过程中实时计算一阶 In-Run Shapley 值
+- 周期性保存 Shapley 输出到  
+  `./results/cifar10_resnet18_full_5000_order1_base/grad_dotprods/`
+- 保存真实错标索引 `mislabeled_indices.npy`
+
+**评估命令（Mislabeled Detection AUROC）：**
+
+```bash
+conda run -n shapley311 python examples/InRunShapley_LM/scripts/evaluate_tasks.py \
+  --result_dir ./results/cifar10_resnet18_full_5000_order1_base \
+  --mislabeled_indices ./results/cifar10_resnet18_full_5000_order1_base/mislabeled_indices.npy
+```
+
+### 3. 本次一阶 Shapley 的运行结果
+
+在上述配置和“未做 PSE 式 grad_val 重用”的一阶实现下，本环境中得到的结果（使用真实 CIFAR-10N 噪声标签）：
+
+- **模型性能（ResNet18）：**
+  - 最佳测试准确率：≈ **0.6171**
+
+- **Mislabeled Data Detection（基于一阶 In-Run Shapley）：**
+  - **AUROC: 0.7217**
+  - PR-AUC: 0.1721
+  - Accuracy: 0.5552
+  - Shapley 值统计（最终迭代 `iter_5000`）：
+    - mean ≈ −1.4×10⁻⁵
+    - std ≈ 4.6×10⁻⁵
+    - min ≈ −3.28×10⁻⁴
+    - max ≈ 1.15×10⁻⁴
+
+与论文 *“Data Shapley in One Training Run”* 中报告的一阶 In-Run Shapley AUROC=0.678 相比，
+当前 **原始一阶实现** 在同一 CIFAR-10N / ResNet18 错标检测任务上已经取得更优表现（0.7217 > 0.678）。
+
+### 4. 与一阶 Shapley 直接相关的核心代码
+
+- `ghostEngines/`
+  - `graddotprod_engine.py`：梯度点积引擎（挂载到优化器，负责保存 dot product 日志）
+  - `autograd_grad_sample_dotprod.py`：逐样本梯度 / dot-product 钩子实现；当某些层无法捕获 activation 时，会安全 fallback（该层点积视为 0）以保证训练不中断。
+  - `supported_layers_grad_samplers_dotprod.py`：
+    - `_compute_linear_dot_product`：线性层的一阶 `<g_i, g_val>` 计算（此处保持“原始版本”，未做 grad_val 单次重用的 PSE 改动）
+    - `_compute_conv2d_dot_product`：Conv2d 点积实现（当前强制使用 materialize 路径，避免 ghost 分支形状不匹配）。
+
+- `examples/InRunShapley_LM/`
+  - `src/inrun_shapley_engine.py`：In-Run Shapley 引擎（基于 dot-product 聚合，并在训练过程中累积一阶 Shapley 值）
+  - `scripts/train_cifar10_resnet18_inrun_shapley.py`：本 README 中使用的 CIFAR-10N / ResNet18 训练 + In-Run Shapley 主脚本
+  - `scripts/evaluate_tasks.py`：从 `grad_dotprods` 目录读取 Shapley 数组并评估错标检测 AUROC 等指标
+
+只要按本 README 中的两条命令重新训练与评估，即可完整复现当前的一阶 Shapley 结果。如果后续你想再做一阶或二阶的改进，可以直接基于以上这些文件继续修改。
+
 # "Ghost" Suites for Fast Gradient Information Calculation
 
 

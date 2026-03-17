@@ -93,14 +93,15 @@ def _compute_linear_dot_product(
 
     total_bs = A.size(0)
     train_bs = total_bs - val_batch_size
-    
-    # Setup Dimensions
+    if train_bs <= 0:
+        return
+
+    # Setup Dimensions (2D input e.g. ResNet fc: seq_len=1; 3D+ use seq_len)
     d_in = A.size(-1)
     d_out = B.size(-1)
+    seq_len = A.shape[1] if A.dim() > 2 else 1
     A_flat = A.to(compute_dtype).reshape(-1, d_in)
     B_flat = B.to(compute_dtype).reshape(-1, d_out)
-
-    seq_len = A.shape[1]
     split_idx = train_bs * seq_len
 
     A_train = A_flat[:split_idx]  # [train_bs*seq_len, d_in]
@@ -747,6 +748,8 @@ def _compute_conv2d_dot_product(
     B_val_r = B_val.reshape(B_val.size(0), B_val.size(1), -1)
 
     _should_use_ghost_computation(layer, A_train_u, B_train_r, conv=True)
+    # Conv2d ghost branch has shape mismatch (AA vs BB); use materialize path only.
+    layer.use_ghost_computation = False
 
     weight_train_norm = None
     weight_val_norm_sq = None
