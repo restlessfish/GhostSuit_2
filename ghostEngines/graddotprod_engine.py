@@ -28,6 +28,7 @@ class GradDotProdEngine:
         use_dummy_bias: bool = False,
         dot_prod_save_path: Optional[str] = None,
         log_grad_norms: bool = False,
+        grad_val_cache_K: int = 0,
     ):
         """
         Initializes the GradDotProdEngine.
@@ -39,6 +40,8 @@ class GradDotProdEngine:
                           This is needed to correctly scale the backpropagated gradients.
             use_dummy_bias: If True, the bias parameters are set to not require gradients.
             dot_prod_save_path: The directory where the dot product log will be saved.
+            grad_val_cache_K: If >0, reuse cached validation gradient every K steps (step % K != 0);
+                              step % K == 0 recomputes and updates cache. Speeds up backward at cost of approximation.
         """
         super().__init__()
 
@@ -47,7 +50,10 @@ class GradDotProdEngine:
         self.loss_reduction = loss_reduction
         self.dot_prod_save_path = dot_prod_save_path
         self.log_grad_norms = log_grad_norms
+        self.grad_val_cache_K = int(grad_val_cache_K) if grad_val_cache_K is not None else 0
         self._saved_tensor_mgr = None
+        self._use_cached_grad_val = False
+        self._cache_grad_val_this_step = False
 
         if use_dummy_bias:
             transformers_support.add_dummy_bias_to_embeddings(module)
@@ -108,6 +114,8 @@ class GradDotProdEngine:
             log_grad_norms=self.log_grad_norms
         )
         self._saved_tensor_mgr = getattr(self.module, "_ghost_saved_tensor_mgr", None)
+        for _, layer in self.module.named_modules():
+            layer._ghost_engine_ref = self
 
         # Keep a reference to the engine on the optimizer for convenience
         optimizer.grad_dot_prod_engine = self
@@ -126,6 +134,11 @@ class GradDotProdEngine:
         autograd_grad_sample_dotprod.remove_hooks(self.module)
         self.module.zero_grad()
         self._saved_tensor_mgr = None
+        for _, layer in self.module.named_modules():
+            if hasattr(layer, '_ghost_engine_ref'):
+                del layer._ghost_engine_ref
+            if hasattr(layer, 'weight') and hasattr(layer.weight, '_ghost_cached_grad_val'):
+                del layer.weight._ghost_cached_grad_val
 
         # Clean up custom attributes from all parameters
         for param in self.module.parameters():
@@ -133,6 +146,8 @@ class GradDotProdEngine:
                 del param.train_grad
             if hasattr(param, 'grad_dot_prod'):
                 del param.grad_dot_prod
+            if hasattr(param, '_ghost_cached_grad_val'):
+                del param._ghost_cached_grad_val
             # Clean up temporary attributes left by hooks
             if hasattr(param, 'activations'):
                 del param.activations

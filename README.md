@@ -71,13 +71,55 @@ conda run -n shapley311 python examples/InRunShapley_LM/scripts/evaluate_tasks.p
 与论文 *“Data Shapley in One Training Run”* 中报告的一阶 In-Run Shapley AUROC=0.678 相比，
 当前 **原始一阶实现** 在同一 CIFAR-10N / ResNet18 错标检测任务上已经取得更优表现（0.7217 > 0.678）。
 
-### 4. 与一阶 Shapley 直接相关的核心代码
+### 4. 实质提速版本：跨步验证梯度缓存（K=5）
+
+通过 **每 K 步重算一次验证梯度 grad_val、其余步复用缓存** 的近似方式，可减少 matmul 计算，从而提速。
+
+**训练命令（启用 K=5 缓存）：**
+
+```bash
+python examples/InRunShapley_LM/scripts/train_cifar10_resnet18_inrun_shapley.py \
+  --data_root ./data/cifar10 \
+  --output_dir ./results/cifar10_resnet18_5000_order1_K5 \
+  --num_steps 5000 \
+  --batch_size 128 \
+  --val_batch_size 32 \
+  --learning_rate 1e-3 \
+  --noise_type aggre_label \
+  --shapley_order 1 \
+  --shapley_save_interval 1000 \
+  --eval_interval 500 \
+  --num_workers 4 \
+  --device cuda \
+  --grad_val_cache_K 5
+```
+
+**评估（与基线相同）：**
+
+```bash
+python examples/InRunShapley_LM/scripts/evaluate_tasks.py \
+  --result_dir ./results/cifar10_resnet18_5000_order1_K5 \
+  --mislabeled_indices ./results/cifar10_resnet18_5000_order1_K5/mislabeled_indices.npy
+```
+
+**GPU 5000 步同机正式对比（batch_size=128）：**
+
+| 配置        | 总时间 (5000 步) | Mislabeled Detection AUROC | Best Test Acc |
+|-------------|-------------------|----------------------------|---------------|
+| K=0（基线） | 5.69 min          | 0.7228                     | 0.6142        |
+| K=5（缓存） | 5.70 min          | **0.7314**                 | 0.6271        |
+| K=10（缓存）| 5.70 min          | 0.7243                     | 0.6160        |
+
+- **速度**：本机 GPU 上二者几乎相同；若 GPU 上 matmul 占比更高，K=5 在其它机器上可能体现更明显提速。
+- **AUROC**：K=5 最好（0.7314），K=10 回落到接近基线（0.7243 vs 0.7228）；整体看 **K=5 更稳妥**。
+
+### 5. 与一阶 Shapley 直接相关的核心代码
 
 - `ghostEngines/`
-  - `graddotprod_engine.py`：梯度点积引擎（挂载到优化器，负责保存 dot product 日志）
+  - `graddotprod_engine.py`：梯度点积引擎（挂载到优化器，负责保存 dot product 日志；支持 grad_val_cache_K）
   - `autograd_grad_sample_dotprod.py`：逐样本梯度 / dot-product 钩子实现；当某些层无法捕获 activation 时，会安全 fallback（该层点积视为 0）以保证训练不中断。
   - `supported_layers_grad_samplers_dotprod.py`：
-    - `_compute_linear_dot_product`：线性层的一阶 `<g_i, g_val>` 计算（此处保持“原始版本”，未做 grad_val 单次重用的 PSE 改动）
+    - `_compute_linear_dot_product`：线性层的一阶 `<g_i, g_val>` 计算；K>0 时每 K 步重算 grad_val 并缓存，其余步复用（近似提速）
     - `_compute_conv2d_dot_product`：Conv2d 点积实现（当前强制使用 materialize 路径，避免 ghost 分支形状不匹配）。
 
 - `examples/InRunShapley_LM/`

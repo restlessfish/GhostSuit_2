@@ -48,6 +48,7 @@ class InRunShapleyEngine(GradDotProdEngine):
         order: int = 1,
         accumulate_shapley: bool = True,
         shapley_save_interval: int = 10,
+        grad_val_cache_K: int = 0,
     ):
         """
         Initialize In-Run Shapley Engine.
@@ -62,6 +63,7 @@ class InRunShapleyEngine(GradDotProdEngine):
             order: Order of approximation (1 for first-order, 2 for second-order)
             accumulate_shapley: Whether to accumulate Shapley values across iterations
             shapley_save_interval: How often to save Shapley values
+            grad_val_cache_K: If >0, reuse cached validation gradient every K steps (approximate speedup).
         """
         super().__init__(
             module=module,
@@ -70,6 +72,7 @@ class InRunShapleyEngine(GradDotProdEngine):
             use_dummy_bias=use_dummy_bias,
             dot_prod_save_path=dot_prod_save_path,
             log_grad_norms=log_grad_norms,
+            grad_val_cache_K=grad_val_cache_K,
         )
         
         self.order = order

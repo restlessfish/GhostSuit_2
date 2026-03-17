@@ -115,11 +115,28 @@ def _compute_linear_dot_product(
     # Decide whether to use ghost computation
     _should_use_ghost_computation(layer, A, B)
 
+    # --- 跨步 grad_val 缓存（K>0 时每 K 步重算，其余步复用，近似提速）---
+    engine = getattr(layer, "_ghost_engine_ref", None)
+    use_cached = (
+        engine is not None
+        and getattr(engine, "grad_val_cache_K", 0) > 0
+        and getattr(engine, "_use_cached_grad_val", False)
+    )
+    cache_this = (
+        engine is not None
+        and getattr(engine, "grad_val_cache_K", 0) > 0
+        and getattr(engine, "_cache_grad_val_this_step", False)
+    )
+    cached = getattr(layer.weight, "_ghost_cached_grad_val", None)
+    if use_cached and cached is not None:
+        grad_val = cached.to(device=A.device, dtype=compute_dtype)
+    else:
+        grad_val = torch.matmul(B_val.T, A_val)
+        if cache_this:
+            layer.weight._ghost_cached_grad_val = grad_val.detach().clone()
+
     if layer.use_ghost_computation:
         # --- ghost computation with associativity trick ---
-
-        # compute validation gradient [d_out, d_in]
-        grad_val = torch.matmul(B_val.T, A_val)
 
         # project grad_val by B_train to remove the d_out dimension 
         # [train_bs*seq_len, d_out] @ [d_out, d_in] = [train_bs*seq_len, d_in]
@@ -135,9 +152,6 @@ def _compute_linear_dot_product(
     else:
         
         # --- materialize gradients ---
-        # compute validation gradient [d_out, d_in]
-        grad_val = torch.matmul(B_val.T, A_val)
-
         # Reshape for sum-over-T contraction
         A_train_3d = A_train.view(train_bs, seq_len, d_in)
         B_train_3d = B_train.view(train_bs, seq_len, d_out)

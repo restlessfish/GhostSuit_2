@@ -78,6 +78,7 @@ def train_cifar10_resnet18(
     eval_interval: int = 500,
     num_workers: int = 4,
     device: str = "cuda",
+    grad_val_cache_K: int = 0,
 ):
     os.makedirs(output_dir, exist_ok=True)
     dot_prod_save_path = os.path.join(output_dir, "grad_dotprods")
@@ -96,8 +97,9 @@ def train_cifar10_resnet18(
 
     train_dataset = IndexedNoisyCIFAR10(root=data_root, noise_type=noise_type, train=True, download=True, transform=train_transform)
     test_dataset = IndexedNoisyCIFAR10(root=data_root, noise_type=noise_type, train=False, download=False, transform=val_transform)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(test_dataset, batch_size=val_batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    pin_mem = device == "cuda"
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_mem)
+    val_loader = DataLoader(test_dataset, batch_size=val_batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
 
     num_mislabeled = len(train_dataset.mislabeled_indices)
     mislabeled_file = os.path.join(output_dir, "mislabeled_indices.npy")
@@ -120,6 +122,7 @@ def train_cifar10_resnet18(
         order=shapley_order,
         accumulate_shapley=True,
         shapley_save_interval=shapley_save_interval,
+        grad_val_cache_K=grad_val_cache_K,
     )
     engine.attach(optimizer)
 
@@ -127,7 +130,7 @@ def train_cifar10_resnet18(
         "dataset": "CIFAR-10", "noise_source": "CIFAR-10N", "noise_type": noise_type,
         "num_train": len(train_dataset), "num_test": len(test_dataset), "num_mislabeled": num_mislabeled,
         "num_steps": num_steps, "batch_size": batch_size, "val_batch_size": val_batch_size,
-        "shapley_order": shapley_order,
+        "shapley_order": shapley_order, "grad_val_cache_K": grad_val_cache_K,
     }
     with open(os.path.join(output_dir, "run_metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
@@ -156,6 +159,9 @@ def train_cifar10_resnet18(
         train_indices = train_indices.numpy().tolist()
 
         engine.attach_train_batch(X_train, Y_train, step, train_indices)
+        K = getattr(engine, "grad_val_cache_K", 0) or 0
+        engine._use_cached_grad_val = (K > 0 and (step % K) != 0)
+        engine._cache_grad_val_this_step = (K > 0 and (step % K) == 0)
         optimizer.zero_grad()
         X_cat = torch.cat((X_train, X_val), dim=0)
         Y_cat = torch.cat((Y_train, Y_val), dim=0)
@@ -229,6 +235,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_interval", type=int, default=500)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--grad_val_cache_K", type=int, default=0, help="Reuse cached grad_val every K steps (0=off).")
     args = parser.parse_args()
     train_cifar10_resnet18(
         data_root=args.data_root,
@@ -243,4 +250,5 @@ if __name__ == "__main__":
         eval_interval=args.eval_interval,
         num_workers=args.num_workers,
         device=args.device,
+        grad_val_cache_K=args.grad_val_cache_K,
     )
