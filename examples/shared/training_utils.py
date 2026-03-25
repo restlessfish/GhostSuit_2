@@ -50,6 +50,18 @@ def load_dataset_main(train_set, val_set):
         )
     elif train_set == 'pile':
         dataset = load_all_data()
+    elif train_set == 'local_bin':
+        # Local binary token dataset (train.bin/val.bin/test.bin) for quick benchmarking.
+        # Uses SimpleDataLoader from InRunShapley_LM.
+        import os as _os
+        import sys as _sys
+        # Add InRunShapley_LM src to path (relative to this shared/ directory)
+        _sys.path.append(_os.path.join(_os.path.dirname(__file__), "..", "InRunShapley_LM", "src"))
+        from simple_dataloader import SimpleDataLoader  # type: ignore
+
+        # We store the loader in a dict to match the rest of the code's expectation.
+        # The actual block_size is applied inside setup_data_functions (needs config.block_size).
+        dataset = {"_local_bin_loader_cls": SimpleDataLoader}
     else:
         raise ValueError(f"Unsupported training set: {train_set}")
     
@@ -110,6 +122,25 @@ def setup_data_functions(dataset, config, device, ddp_info=None):
                     # No deterministic mapping to original dataset indices
                     return X_val, Y_val, torch.full((batch_size,), -1, device=device)
                 return X_val, Y_val
+            return get_batch('val', batch_size, return_idx=return_idx)
+
+    elif config.args.train_set == 'local_bin':
+        # Local binary token dataset; intended for throughput/overhead benchmarking.
+        data_dir = getattr(config, "data_dir", None)
+        if not data_dir:
+            raise ValueError("--data_dir is required when --train_set local_bin")
+        loader_cls = dataset.get("_local_bin_loader_cls", None) if isinstance(dataset, dict) else None
+        if loader_cls is None:
+            raise ValueError("local_bin dataset loader not initialized")
+
+        local_loader = loader_cls(data_dir=data_dir, block_size=getattr(config, "block_size", 1024))
+
+        def get_batch(split, batch_size, return_idx=False):
+            # Map to SimpleDataLoader splits
+            X, Y, idx = local_loader.get_batch(split, batch_size=batch_size, device=device, return_idx=True, generator=generators.get(split))
+            return (X, Y, idx) if return_idx else (X, Y)
+
+        def get_val_batch(batch_size, return_idx=False):
             return get_batch('val', batch_size, return_idx=return_idx)
         
     elif config.args.train_set in LLAVA_LIST:
@@ -417,7 +448,13 @@ class ShapleyProcessor:
 
 def cleanup_distributed():
     """Cleanup distributed training."""
-    destroy_process_group()
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            destroy_process_group()
+    except Exception:
+        # Best-effort cleanup; non-DDP runs should not crash at teardown.
+        return
 
 
 def print_training_info(config):

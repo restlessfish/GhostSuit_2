@@ -44,6 +44,7 @@ class InRunShapleyTrainer:
         # Training state
         self.iter_num = 0
         self.best_val_loss = 1e9
+        self._throughput_log = []
         
         # Prepare validation data for ghost engines
         val_data = None
@@ -165,6 +166,7 @@ class InRunShapleyTrainer:
         # Prepare gradients using ghost engine
         self.ghost_engine.prepare_gradients()
         
+        # Print progress early (loss/lr). Throughput is printed after synchronize().
         print(f"Step {iter_num}, Loss: {loss.item() if loss is not None else 'N/A'}, LR: {lr:.6f}")
         
         # Gradient clipping and optimization step
@@ -186,10 +188,22 @@ class InRunShapleyTrainer:
         torch.cuda.synchronize()
         end_time = time.time()
         
-        # Log metrics
+        # Log metrics / throughput
+        step_time = end_time - start_time
+        # Throughput metric aligned with the paper: datapoints per second.
+        # Here "datapoint" = one training sample (not tokens). For DDP, multiply by world_size.
+        world_size = int(self.ddp_info.get("world_size", 1) or 1)
+        # One optimizer step processes config.batch_size training samples per rank.
+        # Validation samples are concatenated only for ghost computation; exclude them for training throughput.
+        train_samples_this_step = int(self.config.batch_size) * world_size
+        throughput = float(train_samples_this_step / step_time) if step_time > 0 else 0.0
+        self._throughput_log.append(throughput)
+        print(f"Step {iter_num}, Throughput: {throughput:.2f} datapoints/s (world_size={world_size}, step_time={step_time:.4f}s)")
         metrics = {
             "train/lr": lr,
-            "train/step_time": end_time - start_time
+            "train/step_time": step_time,
+            "train/throughput_datapoints_per_s": throughput,
+            "train/world_size": world_size,
         }
         if loss is not None:
             metrics["train/loss"] = loss.item()
@@ -233,6 +247,16 @@ class InRunShapleyTrainer:
     def _cleanup(self, result_file):
         """Cleanup training resources."""
         print("Running cleanup...")
+
+        # Print throughput summary for quick benchmarking (paper-aligned metric).
+        if self._throughput_log:
+            warmup = int(os.getenv("THROUGHPUT_WARMUP_STEPS", "10"))
+            vals = self._throughput_log[warmup:] if warmup < len(self._throughput_log) else self._throughput_log
+            if vals:
+                import numpy as _np
+                mean_tp = float(_np.mean(vals))
+                std_tp = float(_np.std(vals))
+                print(f"[THROUGHPUT] mean={mean_tp:.2f} std={std_tp:.2f} datapoints/s (excluded first {warmup} steps)")
         
         # Run evaluation at the end of training
         self._run_evaluation(result_file)

@@ -37,8 +37,14 @@ def parse_arguments():
     parser.add_argument('--seed', type=int, default=42)
     
     # Dataset parameters
-    parser.add_argument('--train_set', type=str, default='pile')
-    parser.add_argument('--val_set', type=str, default='pile')
+    parser.add_argument('--train_set', type=str, default='pile',
+                       choices=['pile', 'local_bin'])
+    parser.add_argument('--val_set', type=str, default='pile',
+                       choices=['pile', 'local_bin'])
+    parser.add_argument('--data_dir', type=str, default=None,
+                       help='For local_bin dataset: directory containing train.bin/val.bin/test.bin')
+    parser.add_argument('--block_size', type=int, default=1024,
+                       help='Sequence length for local_bin dataset batching')
     
     # Evaluation parameters
     parser.add_argument('--eval_only', action='store_true')
@@ -55,6 +61,12 @@ def parse_arguments():
                        help='How often to save Shapley values')
     parser.add_argument('--dot_prod_save_interval', type=int, default=10,
                        help='How often to save gradient dot products')
+    parser.add_argument(
+        '--grad_val_cache_K',
+        type=int,
+        default=0,
+        help='If >0, reuse cached validation gradient every K steps (approximate speedup).',
+    )
     
     # Precision parameters
     parser.add_argument('--model_dtype', type=str, default='float32',
@@ -74,6 +86,20 @@ def parse_arguments():
                        help='Refresh validation batch every training step')
     parser.add_argument('--log_grad_norms', action='store_true',
                        help='Record per-sample training gradient norms')
+
+    # Optional: restrict ghost dot-product hooks to selected layers (hotspot-only hooking)
+    parser.add_argument(
+        '--include_layer_names',
+        type=str,
+        default=None,
+        help='Comma-separated module names to include for ghost dot-product hooks (e.g., "transformer.h.0.mlp.c_fc,transformer.h.0.mlp.c_proj").'
+    )
+    parser.add_argument(
+        '--include_layer_names_file',
+        type=str,
+        default=None,
+        help='Path to a JSON file exported by GHOST_DOTPROD_BENCH_EXPORT_PATH; uses include_layer_names_topk.'
+    )
     
     return parser.parse_args()
 
@@ -109,6 +135,10 @@ class InRunShapleyConfig:
         self.device = 'cuda'
         self.compile = False
         self.backend = 'nccl'
+
+        # Dataset settings (for local_bin)
+        self.data_dir = getattr(args, "data_dir", None)
+        self.block_size = int(getattr(args, "block_size", 1024))
         
         # Precision settings
         self.model_dtype = args.model_dtype
@@ -129,6 +159,7 @@ class InRunShapleyConfig:
         self.accumulate_shapley = args.accumulate_shapley
         self.shapley_save_interval = args.shapley_save_interval
         self.dot_prod_save_interval = args.dot_prod_save_interval
+        self.grad_val_cache_K = int(getattr(args, "grad_val_cache_K", 0) or 0)
         
         # WandB settings
         self.use_wandb = args.wandb
@@ -144,11 +175,33 @@ class InRunShapleyConfig:
         self.wandb_mode = args.wandb_mode
         self.dynamic_val_batch = args.dynamic_val_batch
         self.log_grad_norms = args.log_grad_norms
+
+        # Layer include list (for hotspot-only hook)
+        self.include_layer_names = self._parse_include_layer_names(args)
         
         # Result directory setup
         self.result_folder = os.path.join(RESULTS_DIR, self.wandb_run_name)
         self.setup_result_directories()
         self.wandb_dir = args.wandb_dir or self.result_dir
+
+    def _parse_include_layer_names(self, args):
+        # Priority: file -> CLI comma list -> None
+        if getattr(args, "include_layer_names_file", None):
+            import json
+            path = args.include_layer_names_file
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                names = data.get("include_layer_names_topk", None)
+                if isinstance(names, list) and all(isinstance(x, str) for x in names):
+                    return names
+            except Exception as e:
+                print(f"[WARN] Failed to parse include_layer_names_file={path}: {e}")
+        s = getattr(args, "include_layer_names", None)
+        if not s:
+            return None
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        return parts or None
     
     def setup_result_directories(self):
         """Create result directories."""

@@ -20,7 +20,8 @@ try:
     import sys
     import os
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from examples.InRunShapley_LM.inrun_shapley_engine import InRunShapleyEngine
+    # InRunShapley implementation lives under examples/InRunShapley_LM/src
+    from examples.InRunShapley_LM.src.inrun_shapley_engine import InRunShapleyEngine
     INRUN_SHAPLEY_AVAILABLE = True
 except ImportError:
     INRUN_SHAPLEY_AVAILABLE = False
@@ -89,7 +90,9 @@ class GhostEngineManager:
             loss_reduction='mean',
             use_dummy_bias=True,
             dot_prod_save_path=dot_prod_save_path,
-            log_grad_norms=getattr(self.config, "log_grad_norms", False)
+            log_grad_norms=getattr(self.config, "log_grad_norms", False),
+            grad_val_cache_K=getattr(self.config, "grad_val_cache_K", 0),
+            include_layer_names=getattr(self.config, "include_layer_names", None),
         )
         
         # Attach to optimizer
@@ -132,6 +135,8 @@ class GhostEngineManager:
             order=shapley_order,
             accumulate_shapley=accumulate_shapley,
             shapley_save_interval=shapley_save_interval,
+            grad_val_cache_K=getattr(self.config, "grad_val_cache_K", 0),
+            include_layer_names=getattr(self.config, "include_layer_names", None),
         )
         
         # Attach to optimizer
